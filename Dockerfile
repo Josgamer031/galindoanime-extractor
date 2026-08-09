@@ -9,4 +9,4 @@ COPY main.py ./
 ENV PORT=10000
 EXPOSE 10000
 
-CMD ["python", "main.py"]
+CMD ["python3", "main.py"]
