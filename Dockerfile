@@ -9,7 +9,9 @@ RUN python3 -m pip install --no-cache-dir playwright==1.40.0
 
 COPY main.py ./
 
-ENV PORT=10000
+# NO fijar ENV PORT: Render lo inyecta dinamicamente en el contenedor.
+# Si lo fijamos, el server escucha en 10000 pero Render espera el PORT que
+# asigna, y responde 502. main.py usa os.environ.get("PORT","10000") como fallback.
 EXPOSE 10000
 
 CMD ["python3", "main.py"]
