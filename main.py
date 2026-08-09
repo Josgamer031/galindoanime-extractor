@@ -96,8 +96,20 @@ def extract_many(urls, wait_ms=15000):
         t = threading.Thread(target=worker, args=(i, u), daemon=True)
         t.start()
         threads.append(t)
+    # Devolver en cuanto el PRIMER embed resuelva video (no esperar a todos).
+    # Si ninguno resuelve, esperar a que terminen los threads (timeout generoso).
+    import time as _t
+    deadline = _t.time() + (wait_ms / 1000) + 45  # tope para no colgar al serverless
+    while _t.time() < deadline:
+        for i in sorted(results.keys()):
+            r = results.get(i)
+            if isinstance(r, dict) and r.get("videos"):
+                return {"videos": r["videos"]}
+        if all(not t.is_alive() for t in threads):
+            break
+        _t.sleep(1)
     for t in threads:
-        t.join(timeout=wait_ms / 1000 + 60)
+        t.join(timeout=1)
     # devolver el primer video encontrado, en orden de los embeds
     for i in sorted(results.keys()):
         r = results[i]
