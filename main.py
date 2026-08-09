@@ -78,6 +78,39 @@ def extract_video(url, wait_ms=15000):
         return {"error": str(e)}
 
 
+def extract_many(urls, wait_ms=15000):
+    """Prueba VARIOS embeds en PARALELO (threads) y devuelve el primer
+    video crudo que cualquiera resuelva. Asi el /episode no espera N veces
+    secuencialmente: la latencia es la de UN solo embed (el mas rapido)."""
+    import threading
+    results = {}
+    lock = threading.Lock()
+
+    def worker(idx, u):
+        r = extract_video(u, wait_ms=wait_ms)
+        with lock:
+            results[idx] = r
+
+    threads = []
+    for i, u in enumerate(urls[:6]):  # maximo 6 en paralelo
+        t = threading.Thread(target=worker, args=(i, u), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=wait_ms / 1000 + 60)
+    # devolver el primer video encontrado, en orden de los embeds
+    for i in sorted(results.keys()):
+        r = results[i]
+        if isinstance(r, dict) and r.get("videos"):
+            return {"videos": r["videos"]}
+    # si ninguno resolvio, devolver el primer error encontrado (o vacio)
+    for i in sorted(results.keys()):
+        r = results[i]
+        if isinstance(r, dict) and "error" in r:
+            return {"error": r["error"]}
+    return {"videos": []}
+
+
 class handler(BaseHTTPRequestHandler):
     def _send(self, code, obj):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -92,18 +125,25 @@ class handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path.rstrip("/") in ("/extract", ""):
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
-            url = qs.get("url", [""])[0]
-            if not url or not url.startswith("http"):
+            urls = qs.get("url", [""])
+            # soporta multiples embeds separados por coma (urls=a,b,c)
+            flat = []
+            for u in urls:
+                for part in u.split(","):
+                    part = part.strip()
+                    if part:
+                        flat.append(part)
+            if not flat or not flat[0].startswith("http"):
                 return self._send(400, {"error": "missing url param"})
             try:
                 wait = int(qs.get("wait", ["15000"])[0])
             except Exception:
                 wait = 15000
             try:
-                res = extract_video(url, wait_ms=wait)
+                res = extract_many(flat, wait_ms=wait)
                 if "error" in res:
-                    return self._send(200, {"url": url, "videos": [], "count": 0, "warn": res["error"]})
-                return self._send(200, {"url": url, "videos": res.get("videos", []), "count": len(res.get("videos", []))})
+                    return self._send(200, {"url": flat[0], "videos": [], "count": 0, "warn": res["error"]})
+                return self._send(200, {"url": flat[0], "videos": res.get("videos", []), "count": len(res.get("videos", []))})
             except Exception as e:
                 return self._send(500, {"error": str(e)})
         return self._send(404, {"error": "not_found"})
