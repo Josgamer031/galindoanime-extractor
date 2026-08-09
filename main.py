@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 PORT = int(os.environ.get("PORT", "10000"))
 
 
-def extract_video(url):
+def extract_video(url, wait_ms=15000):
     """Abre el embed con Chromium headless y captura la URL de video cruda.
 
     El import de playwright es LAZY (dentro de la funcion) para que el
@@ -18,6 +18,7 @@ def extract_video(url):
     except Exception as imp_err:
         return {"error": "playwright_import_failed: " + str(imp_err)}
     try:
+        import re as _re
         found = []
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -45,16 +46,30 @@ def extract_video(url):
 
             page.on("response", on_response)
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                page.goto(url, wait_until="networkidle", timeout=45000)
             except Exception:
-                pass
-            page.wait_for_timeout(8000)
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+            # Esperar a que cargue el player (el video aparece tras JS/ads)
+            page.wait_for_timeout(wait_ms)
+            # <video> en el DOM (currentSrc/src)
             try:
                 vids = page.eval_on_selector_all(
                     "video", "els => els.map(e => e.currentSrc || e.src).filter(Boolean)")
                 for v in vids:
                     if v not in found:
                         found.append(v)
+            except Exception:
+                pass
+            # fallback: buscar URLs de video directas en el HTML final
+            try:
+                html = page.content()
+                for m in _re.finditer(r'(https?://[^\s"\'<>]+?\.(?:mp4|m3u8|ts|webm))', html, _re.I):
+                    u = m.group(1)
+                    if u not in found:
+                        found.append(u)
             except Exception:
                 pass
             browser.close()
@@ -81,7 +96,11 @@ class handler(BaseHTTPRequestHandler):
             if not url or not url.startswith("http"):
                 return self._send(400, {"error": "missing url param"})
             try:
-                res = extract_video(url)
+                wait = int(qs.get("wait", ["15000"])[0])
+            except Exception:
+                wait = 15000
+            try:
+                res = extract_video(url, wait_ms=wait)
                 if "error" in res:
                     return self._send(200, {"url": url, "videos": [], "count": 0, "warn": res["error"]})
                 return self._send(200, {"url": url, "videos": res.get("videos", []), "count": len(res.get("videos", []))})
