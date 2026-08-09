@@ -46,12 +46,12 @@ def extract_video(url, wait_ms=15000):
 
             page.on("response", on_response)
             try:
-                page.goto(url, wait_until="networkidle", timeout=45000)
+                # NO usar networkidle: los anuncios de los embeds mantienen la
+                # red activa y never-idle, lo que hace colgar el goto hasta el
+                # timeout. domcontentloaded + wait fijo es mas rapido y fiable.
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception:
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                except Exception:
-                    pass
+                pass
             # Esperar a que cargue el player (el video aparece tras JS/ads)
             page.wait_for_timeout(wait_ms)
             # <video> en el DOM (currentSrc/src)
