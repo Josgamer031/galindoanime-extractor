@@ -1,58 +1,66 @@
 import os
 import json
 import urllib.parse
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
-
-# Playwright (Chromium) en Render
-from playwright.sync_api import sync_playwright
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("PORT", "10000"))
 
 
 def extract_video(url):
-    """Abre el embed con Chromium headless y captura la URL de video cruda."""
-    found = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0 Safari/537.36"),
-            java_script_enabled=True,
-        )
-        page = ctx.new_page()
-        # Capturar respuestas de video (mp4/m3u8) en la red
-        def on_response(resp):
+    """Abre el embed con Chromium headless y captura la URL de video cruda.
+
+    El import de playwright es LAZY (dentro de la funcion) para que el
+    servidor HTTP arranque siempre, aunque playwright no este disponible;
+    asi el endpoint responde y podemos Diagnosticar el error de forma remota.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as imp_err:
+        return {"error": "playwright_import_failed: " + str(imp_err)}
+    try:
+        found = []
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"),
+                java_script_enabled=True,
+            )
+            page = ctx.new_page()
+
+            def on_response(resp):
+                try:
+                    ct = resp.headers.get("content-type", "").lower()
+                    u = resp.url
+                    if "video" in ct or u.lower().endswith((".mp4", ".m3u8", ".ts", ".webm")):
+                        if u not in found:
+                            found.append(u)
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
             try:
-                ct = resp.headers.get("content-type", "").lower()
-                u = resp.url
-                if "video" in ct or u.lower().endswith((".mp4", ".m3u8", ".ts", ".webm")):
-                    if u not in found:
-                        found.append(u)
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception:
                 pass
-        page.on("response", on_response)
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        except Exception:
-            pass
-        # Esperar a que cargue el player (el video aparece tras JS/ads)
-        page.wait_for_timeout(8000)
-        # Tambien revisar <video src> en el DOM
-        try:
-            vids = page.eval_on_selector_all(
-                "video", "els => els.map(e => e.currentSrc || e.src).filter(Boolean)")
-            for v in vids:
-                if v not in found:
-                    found.append(v)
-        except Exception:
-            pass
-        browser.close()
-    return found
+            page.wait_for_timeout(8000)
+            try:
+                vids = page.eval_on_selector_all(
+                    "video", "els => els.map(e => e.currentSrc || e.src).filter(Boolean)")
+                for v in vids:
+                    if v not in found:
+                        found.append(v)
+            except Exception:
+                pass
+            browser.close()
+        return {"videos": found}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 class handler(BaseHTTPRequestHandler):
@@ -73,8 +81,10 @@ class handler(BaseHTTPRequestHandler):
             if not url or not url.startswith("http"):
                 return self._send(400, {"error": "missing url param"})
             try:
-                vids = extract_video(url)
-                return self._send(200, {"url": url, "videos": vids, "count": len(vids)})
+                res = extract_video(url)
+                if "error" in res:
+                    return self._send(200, {"url": url, "videos": [], "count": 0, "warn": res["error"]})
+                return self._send(200, {"url": url, "videos": res.get("videos", []), "count": len(res.get("videos", []))})
             except Exception as e:
                 return self._send(500, {"error": str(e)})
         return self._send(404, {"error": "not_found"})
@@ -84,5 +94,5 @@ class handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    from http.server import HTTPServer
+    print(f"Extractor escuchando en 0.0.0.0:{PORT}", flush=True)
     HTTPServer(("0.0.0.0", PORT), handler).serve_forever()
