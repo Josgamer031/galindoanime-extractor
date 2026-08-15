@@ -64,6 +64,20 @@ def extract_video(url, wait_ms=20000):
                     if (("video" in ct) or ("mpegurl" in ct) or ("hls" in ct)
                             or u.lower().endswith((".mp4", ".m3u8", ".ts", ".webm", ".m4v"))):
                         add(u)
+                    # Muchos hosts (mixdrop, voe, bysekoze) entregan la URL del
+                    # video en el BODY de un XHR (JSON/JS), no en la URL ni en un
+                    # <video> directo. Escaneamos el body de respuestas pequeñas
+                    # (JSON/JS/text) buscando URLs de media ofuscadas.
+                    elif ("json" in ct) or ("javascript" in ct) or ("text" in ct) or ("xml" in ct):
+                        try:
+                            body = resp.text()[:200000]
+                            if body:
+                                for m in _MEDIA_RE.finditer(body):
+                                    add(m.group(1))
+                                for m in _SRC_RE.finditer(body):
+                                    add(m.group(1))
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
