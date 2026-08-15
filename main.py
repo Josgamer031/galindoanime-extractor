@@ -14,7 +14,14 @@ _MEDIA_RE = _re.compile(
 # source:"...", "url":"..." o data-src. Captamos cualquier URL con esos vecinos.
 _SRC_RE = _re.compile(
     r'(?:file|hls|src|source|url|data-src|data-file|video|stream|playlist)'
-    r'\s*[:=]\s*["\']?(https?://[^\s"\'<>]+?)["\']?', _re.I)
+    r'\s*[:=]\s*["\']?(https?://[^\s"\']+?)["\']?', _re.I)
+# URLs "sueltas" (los players ofuscados parten la URL en strings JS
+# concatenados, ej. "https://w"+"mixdrop.co/get/x.m3u8"). Captamos https://...
+# hasta espacio y luego saneamos/filtramos por palabras clave de media.
+_LOOSE_RE = _re.compile(r'https?://\S+', _re.I)
+_MEDIA_KEYS = ("mp4", "m3u8", "ts?", "webm", "m4v", "mixdrop", "voe", "byse",
+               "hexload", "savefiles", "stream", "hls", "playlist", "get/",
+               "file/", "media", "video", "cdn", "source", "manifest")
 
 
 def extract_video(url, wait_ms=20000):
@@ -116,11 +123,20 @@ def extract_video(url, wait_ms=20000):
                     add(v)
             except Exception:
                 pass
-            # HTML final: regex amplio
+            # HTML final: URLs "sueltas" (players ofuscados las parten en JS).
+            # Captamos https://... hasta espacio, saneamos comillas/parentesis
+            # sobrantes y filtramos por palabras clave de media para descartar
+            # basura (ej. "https://w"+"mixdrop.co/get/x.m3u8").
             try:
                 html = page.content()
-                for m in _MEDIA_RE.finditer(html):
-                    add(m.group(1))
+                for m in _LOOSE_RE.finditer(html):
+                    raw = m.group(0)
+                    raw = raw.strip().strip('"\'').strip().rstrip('\\\'");,')
+                    if " " in raw:
+                        raw = raw.split(" ")[0]
+                    low = raw.lower()
+                    if any(k in low for k in _MEDIA_KEYS) and raw.startswith("http"):
+                        add(raw)
                 for m in _SRC_RE.finditer(html):
                     add(m.group(1))
             except Exception:
