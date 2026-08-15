@@ -1,6 +1,7 @@
 import os
 import json
 import urllib.parse
+import re as _re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -18,7 +19,6 @@ def extract_video(url, wait_ms=15000):
     except Exception as imp_err:
         return {"error": "playwright_import_failed: " + str(imp_err)}
     try:
-        import re as _re
         found = []
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -123,6 +123,72 @@ def extract_many(urls, wait_ms=15000):
     return {"videos": []}
 
 
+def diag_video(url, wait_ms=15000):
+    """Endpoint de diagnostico: capta TODAS las respuestas de red (url+ctype)
+    y un snippet del HTML, para entender como cada host entrega el video."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as imp_err:
+        return {"error": "playwright_import_failed: " + str(imp_err)}
+    try:
+        resp_log = []
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"),
+                java_script_enabled=True,
+            )
+            page = ctx.new_page()
+
+            def on_response(resp):
+                try:
+                    ct = resp.headers.get("content-type", "")
+                    u = resp.url
+                    # Solo loguear lo que parezca media o player
+                    if any(k in (ct.lower() + " " + u.lower()) for k in
+                           ("mp4", "m3u8", "ts?", "webm", "mpegurl", "manifest",
+                            "playlist", "video", "player", "embed", "stream",
+                            "source", "file", ".mp4")):
+                        resp_log.append({"u": u[:200], "ct": ct[:60]})
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            page.wait_for_timeout(wait_ms)
+            html = ""
+            try:
+                html = page.content()
+            except Exception:
+                pass
+            # videos en DOM
+            doms = []
+            try:
+                doms = page.eval_on_selector_all(
+                    "video", "els => els.map(e => (e.currentSrc||e.src||'')).filter(Boolean)")
+            except Exception:
+                pass
+            browser.close()
+        return {
+            "frames_count": len(resp_log),
+            "responses": resp_log[:80],
+            "dom_videos": doms[:10],
+            "html_len": len(html),
+            "html_snippet": html[:1500],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 class handler(BaseHTTPRequestHandler):
     def _send(self, code, obj):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -156,6 +222,20 @@ class handler(BaseHTTPRequestHandler):
                 if "error" in res:
                     return self._send(200, {"url": flat[0], "videos": [], "count": 0, "warn": res["error"]})
                 return self._send(200, {"url": flat[0], "videos": res.get("videos", []), "count": len(res.get("videos", []))})
+            except Exception as e:
+                return self._send(500, {"error": str(e)})
+        elif path.rstrip("/") == "/diag":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            u = (qs.get("url", [""])[0] or "").strip()
+            if not u.startswith("http"):
+                return self._send(400, {"error": "missing url param"})
+            try:
+                wait = int(qs.get("wait", ["15000"])[0])
+            except Exception:
+                wait = 15000
+            try:
+                res = diag_video(u, wait_ms=wait)
+                return self._send(200, res)
             except Exception as e:
                 return self._send(500, {"error": str(e)})
         return self._send(404, {"error": "not_found"})
