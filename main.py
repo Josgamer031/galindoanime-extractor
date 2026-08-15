@@ -44,9 +44,34 @@ def extract_video(url, wait_ms=20000):
         return {"error": "playwright_import_failed: " + str(imp_err)}
     try:
         found = []
+        # Filtramos URLs placeholder/falsas que los players (Video.js, mixdrop)
+        # dejan como src inicial antes de cargar el video real:
+        #   - example.com/video.mp4 (placeholder por defecto de Video.js)
+        #   - about:blank, blob:, dominios sin punto, o que no parezcan media.
+        _BAD = ("example.com", "example.org", "localhost", "127.0.0.1",
+                "about:blank", "w3.org", "schema.org")
+        def _is_real(u):
+            if not u or not u.startswith("http"):
+                return False
+            if "blob:" in u:
+                return False
+            low = u.lower()
+            if any(b in low for b in _BAD):
+                return False
+            # debe tener un dominio con punto y una extension de media O un
+            # query/path de reproduccion (get/, playlist, m3u8, mp4, file/...)
+            host = low.split("//", 1)[1].split("/", 1)[0] if "//" in low else ""
+            if "." not in host:
+                return False
+            if any(k in low for k in ("mp4", "m3u8", "ts?", "webm", "m4v",
+                                      "get/", "file/", "playlist", "media",
+                                      "stream", "video", "hls", "source",
+                                      "manifest", "cdn", "m3u", "seg")):
+                return True
+            return False
         def add(u):
             u = (u or "").strip()
-            if u and u.startswith("http") and u not in found and "blob:" not in u:
+            if _is_real(u) and u not in found:
                 found.append(u)
         with sync_playwright() as p:
             browser = p.chromium.launch(
