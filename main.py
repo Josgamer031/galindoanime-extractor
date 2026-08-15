@@ -6,13 +6,30 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("PORT", "10000"))
 
+# Patrones de URL que suelen ser media cruda (mp4/m3u8/ts/webm) incluso si la
+# extension no es canonica (los hosts ofuscados la esconden en query params).
+_MEDIA_RE = _re.compile(
+    r'(https?://[^\s"\'<>]+?\.(?:mp4|m3u8|ts|webm|m4v|mov)(?:[?&#][^\s"\'<>]*)?)', _re.I)
+# En el HTML los players ponen la fuente en strings tipo file:"...", hls:"...",
+# source:"...", "url":"..." o data-src. Captamos cualquier URL con esos vecinos.
+_SRC_RE = _re.compile(
+    r'(?:file|hls|src|source|url|data-src|data-file|video|stream|playlist)'
+    r'\s*[:=]\s*["\']?(https?://[^\s"\'<>]+?)["\']?', _re.I)
 
-def extract_video(url, wait_ms=15000):
+
+def extract_video(url, wait_ms=20000):
     """Abre el embed con Chromium headless y captura la URL de video cruda.
 
-    El import de playwright es LAZY (dentro de la funcion) para que el
-    servidor HTTP arranque siempre, aunque playwright no este disponible;
-    asi el endpoint responde y podemos Diagnosticar el error de forma remota.
+    Estrategia multi-capa (los hosts de peliculas ofuscan el video de formas
+    distintas):
+      1. Listener de TODAS las respuestas de red: capta .mp4/.m3u8/.ts/.webm por
+         extension Y por content-type (mpegurl/hls/video). Las respuestas de
+         sub-iframes cross-origin TAMBIEN se captan (Playwright escucha a nivel
+         de red del browser, no del DOM).
+      2. DOM: <video> currentSrc/src, <source> y players globales
+         (jwplayer/plyr/videojs) que exponen la fuente en JS.
+      3. HTML final: regex amplio para URLs media y para strings tipo
+         file:"..."/hls:"..." que los players ofuscados dejan en el script.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -20,10 +37,15 @@ def extract_video(url, wait_ms=15000):
         return {"error": "playwright_import_failed: " + str(imp_err)}
     try:
         found = []
+        def add(u):
+            u = (u or "").strip()
+            if u and u.startswith("http") and u not in found and "blob:" not in u:
+                found.append(u)
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                      "--autoplay-policy=no-user-gesture-required"],
             )
             ctx = browser.new_context(
                 user_agent=(
@@ -31,45 +53,62 @@ def extract_video(url, wait_ms=15000):
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0 Safari/537.36"),
                 java_script_enabled=True,
+                ignore_https_errors=True,
             )
             page = ctx.new_page()
 
             def on_response(resp):
                 try:
-                    ct = resp.headers.get("content-type", "").lower()
+                    ct = (resp.headers.get("content-type") or "").lower()
                     u = resp.url
-                    if "video" in ct or u.lower().endswith((".mp4", ".m3u8", ".ts", ".webm")):
-                        if u not in found:
-                            found.append(u)
+                    if (("video" in ct) or ("mpegurl" in ct) or ("hls" in ct)
+                            or u.lower().endswith((".mp4", ".m3u8", ".ts", ".webm", ".m4v"))):
+                        add(u)
                 except Exception:
                     pass
 
             page.on("response", on_response)
             try:
-                # NO usar networkidle: los anuncios de los embeds mantienen la
-                # red activa y never-idle, lo que hace colgar el goto hasta el
-                # timeout. domcontentloaded + wait fijo es mas rapido y fiable.
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception:
                 pass
-            # Esperar a que cargue el player (el video aparece tras JS/ads)
+            # Dejar que el player resuelva la fuente (HLS via JS/MSE tarda)
             page.wait_for_timeout(wait_ms)
-            # <video> en el DOM (currentSrc/src)
+            # DOM: <video> + <source>
             try:
                 vids = page.eval_on_selector_all(
-                    "video", "els => els.map(e => e.currentSrc || e.src).filter(Boolean)")
+                    "video, source",
+                    "els => els.flatMap(e => [e.currentSrc||e.src||e.getAttribute('src')||'']"
+                    ".filter(Boolean))")
                 for v in vids:
-                    if v not in found:
-                        found.append(v)
+                    add(v)
             except Exception:
                 pass
-            # fallback: buscar URLs de video directas en el HTML final
+            # Players globales que exponen la fuente
+            try:
+                js = (
+                    "() => {"
+                    "  var out = [];"
+                    "  try { if (window.jwplayer) { var p = jwplayer(); if (p && p.getPlaylist) {"
+                    "    p.getPlaylist().forEach(function(i){ if(i.file) out.push(i.file); }); } } } catch(e){}"
+                    "  try { if (window.videojs) { document.querySelectorAll('video').forEach(function(v){"
+                    "    var s = v.currentSrc||v.src; if(s) out.push(s); }); } } catch(e){}"
+                    "  try { if (window.plyr) { document.querySelectorAll('video').forEach(function(v){"
+                    "    var s = v.currentSrc||v.src; if(s) out.push(s); }); } } catch(e){}"
+                    "  return out;"
+                    "}"
+                )
+                for v in page.evaluate(js):
+                    add(v)
+            except Exception:
+                pass
+            # HTML final: regex amplio
             try:
                 html = page.content()
-                for m in _re.finditer(r'(https?://[^\s"\'<>]+?\.(?:mp4|m3u8|ts|webm))', html, _re.I):
-                    u = m.group(1)
-                    if u not in found:
-                        found.append(u)
+                for m in _MEDIA_RE.finditer(html):
+                    add(m.group(1))
+                for m in _SRC_RE.finditer(html):
+                    add(m.group(1))
             except Exception:
                 pass
             browser.close()
@@ -78,10 +117,9 @@ def extract_video(url, wait_ms=15000):
         return {"error": str(e)}
 
 
-def extract_many(urls, wait_ms=15000):
+def extract_many(urls, wait_ms=20000):
     """Prueba VARIOS embeds en PARALELO (threads) y devuelve el primer
-    video crudo que cualquiera resuelva. Asi el /episode no espera N veces
-    secuencialmente: la latencia es la de UN solo embed (el mas rapido)."""
+    video crudo que cualquiera resuelva."""
     import threading
     results = {}
     lock = threading.Lock()
@@ -92,14 +130,12 @@ def extract_many(urls, wait_ms=15000):
             results[idx] = r
 
     threads = []
-    for i, u in enumerate(urls[:6]):  # maximo 6 en paralelo
+    for i, u in enumerate(urls[:6]):
         t = threading.Thread(target=worker, args=(i, u), daemon=True)
         t.start()
         threads.append(t)
-    # Devolver en cuanto el PRIMER embed resuelva video (no esperar a todos).
-    # Si ninguno resuelve, esperar a que terminen los threads (timeout generoso).
     import time as _t
-    deadline = _t.time() + (wait_ms / 1000) + 45  # tope para no colgar al serverless
+    deadline = _t.time() + (wait_ms / 1000) + 45
     while _t.time() < deadline:
         for i in sorted(results.keys()):
             r = results.get(i)
@@ -110,12 +146,10 @@ def extract_many(urls, wait_ms=15000):
         _t.sleep(1)
     for t in threads:
         t.join(timeout=1)
-    # devolver el primer video encontrado, en orden de los embeds
     for i in sorted(results.keys()):
         r = results[i]
         if isinstance(r, dict) and r.get("videos"):
             return {"videos": r["videos"]}
-    # si ninguno resolvio, devolver el primer error encontrado (o vacio)
     for i in sorted(results.keys()):
         r = results[i]
         if isinstance(r, dict) and "error" in r:
@@ -123,9 +157,9 @@ def extract_many(urls, wait_ms=15000):
     return {"videos": []}
 
 
-def diag_video(url, wait_ms=15000):
+def diag_video(url, wait_ms=20000):
     """Endpoint de diagnostico: capta TODAS las respuestas de red (url+ctype)
-    y un snippet del HTML, para entender como cada host entrega el video."""
+    y un snippet del HTML."""
     try:
         from playwright.sync_api import sync_playwright
     except Exception as imp_err:
@@ -150,7 +184,6 @@ def diag_video(url, wait_ms=15000):
                 try:
                     ct = resp.headers.get("content-type", "")
                     u = resp.url
-                    # Solo loguear lo que parezca media o player
                     if any(k in (ct.lower() + " " + u.lower()) for k in
                            ("mp4", "m3u8", "ts?", "webm", "mpegurl", "manifest",
                             "playlist", "video", "player", "embed", "stream",
@@ -170,7 +203,6 @@ def diag_video(url, wait_ms=15000):
                 html = page.content()
             except Exception:
                 pass
-            # videos en DOM
             doms = []
             try:
                 doms = page.eval_on_selector_all(
@@ -204,7 +236,6 @@ class handler(BaseHTTPRequestHandler):
         if path.rstrip("/") in ("/extract", ""):
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             urls = qs.get("url", [""])
-            # soporta multiples embeds separados por coma (urls=a,b,c)
             flat = []
             for u in urls:
                 for part in u.split(","):
@@ -214,9 +245,9 @@ class handler(BaseHTTPRequestHandler):
             if not flat or not flat[0].startswith("http"):
                 return self._send(400, {"error": "missing url param"})
             try:
-                wait = int(qs.get("wait", ["15000"])[0])
+                wait = int(qs.get("wait", ["20000"])[0])
             except Exception:
-                wait = 15000
+                wait = 20000
             try:
                 res = extract_many(flat, wait_ms=wait)
                 if "error" in res:
@@ -230,9 +261,9 @@ class handler(BaseHTTPRequestHandler):
             if not u.startswith("http"):
                 return self._send(400, {"error": "missing url param"})
             try:
-                wait = int(qs.get("wait", ["15000"])[0])
+                wait = int(qs.get("wait", ["20000"])[0])
             except Exception:
-                wait = 15000
+                wait = 20000
             try:
                 res = diag_video(u, wait_ms=wait)
                 return self._send(200, res)
