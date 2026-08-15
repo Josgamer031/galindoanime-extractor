@@ -129,6 +129,16 @@ def extract_video(url, wait_ms=20000):
             # basura (ej. "https://w"+"mixdrop.co/get/x.m3u8").
             try:
                 html = page.content()
+                # Hosts ofuscados (mixdrop, voe) parten la URL del video en
+                # strings JS concatenados: "https://w"+"mixdrop.co/get/x.m3u8".
+                # Detectamos ese patron y UNIMOS las partes para reconstruir la
+                # URL real (sin las comillas ni el "+").
+                _SPLIT_RE = _re.compile(
+                    r'["\'](https?://[^"\']+?)["\']\s*\+\s*["\']([^"\']+?)["\']')
+                for m in _SPLIT_RE.finditer(html):
+                    joined = m.group(1) + m.group(2)
+                    if any(k in joined.lower() for k in _MEDIA_KEYS):
+                        add(joined)
                 for m in _LOOSE_RE.finditer(html):
                     raw = m.group(0)
                     raw = raw.strip().strip('"\'').strip().rstrip('\\\'");,')
