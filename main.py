@@ -130,7 +130,7 @@ def extract_video(url, wait_ms=20000):
                     add(v)
             except Exception:
                 pass
-            # Players globales que exponen la fuente
+            # Players globales que exponen la fuente (frame PRINCIPAL)
             try:
                 js = (
                     "() => {"
@@ -146,6 +146,21 @@ def extract_video(url, wait_ms=20000):
                 )
                 for v in page.evaluate(js):
                     add(v)
+            except Exception:
+                pass
+            # ITERAR FRAMES: bysekoze carga el video en un iframe (q8y5z.com)
+            # cuyo JWPlayer tiene la URL en memoria. Playwright aísla los frames,
+            # asi que page.evaluate del frame principal no la ve. Evaluamos en
+            # CADA frame para captar la fuente del player interno.
+            try:
+                for frame in page.frames:
+                    try:
+                        fv = frame.evaluate(js)
+                        if fv:
+                            for v in fv:
+                                add(v)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # HTML final: URLs "sueltas" (players ofuscados las parten en JS).
